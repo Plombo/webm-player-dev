@@ -17,7 +17,6 @@ typedef struct {
 	vorbis_comment vc;
 	vorbis_dsp_state v;
 	vorbis_block vb;
-	nestegg *demux_ctx;
 	int channels;
 } vorbis_context;
 

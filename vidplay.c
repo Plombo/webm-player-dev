@@ -20,152 +20,54 @@
 
 // our headers
 #include "vorbis.h"
+#include "threads.h"
 
 // temporary
 #define MAX_AUDIO_FRAME_SIZE 192000
-
+#define ANYNUMBER 2
 #define MIN(X,Y) (((X)<(Y))?(X):(Y))
 
-typedef struct PacketList {
-	nestegg_packet *pkt;
-	struct PacketList *next;
-} PacketList;
+#define PACKET_QUEUE_SIZE 10
 
-typedef struct PacketQueue {
-	PacketList *first_pkt, *last_pkt;
-	int nb_packets;
-	//int size;
-	SDL_mutex *mutex;
-	SDL_cond *cond;
-} PacketQueue;
+typedef struct {
+	int start;
+	int size;
+	int max_size;
+	bor_mutex *mutex;
+	bor_cond *not_full;
+	bor_cond *not_empty;
+	void *data[ANYNUMBER];
+} FixedSizeQueue;
 
-PacketQueue audioq;
-static int quit = 0;
+typedef struct {
+	FixedSizeQueue *packet_queue;
+	vorbis_context vorbis_ctx;
+	vpx_codec_ctx_t vpx_ctx;
+	FixedSizeQueue *frame_queue;
+	int frequency;
+} audio_context;
 
-void packet_queue_init(PacketQueue *q)
-{
-	memset(q, 0, sizeof(PacketQueue));
-	q->mutex = SDL_CreateMutex();
-	q->cond = SDL_CreateCond();
-}
+typedef struct {
+	FixedSizeQueue *packet_queue;
+	SDL_Surface *screen;
+	vpx_codec_ctx_t vpx_ctx;
+	FixedSizeQueue *frame_queue;
+	int width;
+	int height;
+	uint64_t frame_delay;
+} video_context;
 
-int packet_queue_put(PacketQueue *q, nestegg_packet *pkt)
-{
+typedef struct {
+	nestegg *demux_ctx;
+	video_context *video_ctx;
+	FixedSizeQueue *audio_queue;
+	int audio_stream;
+	int video_stream;
+} decoder_context;
 
-	PacketList *pkt1;
-	pkt1 = malloc(sizeof(PacketList));
-	if (!pkt1)
-		return -1;
-	pkt1->pkt = pkt;
-	pkt1->next = NULL;
-	
-	SDL_LockMutex(q->mutex);
-	
-	if (!q->last_pkt)
-		q->first_pkt = pkt1;
-	else
-		q->last_pkt->next = pkt1;
-	q->last_pkt = pkt1;
-	q->nb_packets++;
-	SDL_CondSignal(q->cond);
-	
-	SDL_UnlockMutex(q->mutex);
-	return 0;
-}
-static int packet_queue_get(PacketQueue *q, nestegg_packet **pkt, int block)
-{
-	PacketList *pkt1;
-	int ret;
-	
-	SDL_LockMutex(q->mutex);
-	
-	for(;;) {
-		if(quit) {
-			ret = -1;
-			break;
-		}
 
-		pkt1 = q->first_pkt;
-		if (pkt1) {
-			q->first_pkt = pkt1->next;
-			if (!q->first_pkt)
-				q->last_pkt = NULL;
-			q->nb_packets--;
-			*pkt = pkt1->pkt;
-			free(pkt1);
-			ret = 1;
-			break;
-		} else if (!block) {
-			ret = 0;
-			break;
-		} else {
-			SDL_CondWait(q->cond, q->mutex);
-		}
-	}
-	SDL_UnlockMutex(q->mutex);
-	return ret;
-}
-
-int audio_decode_frame(vorbis_context *vorbis_ctx, uint8_t *audio_buf, int buf_size)
-{
-	static int avail_samples = 0;
-	int samples;
-
-	if (avail_samples == 0)
-	{
-		nestegg_packet *pkt;
-		int chunk, num_chunks;
-		
-		if (packet_queue_get(&audioq, &pkt, 1) < 0)
-			return -1;
-		nestegg_packet_count(pkt, &num_chunks);
-		for (chunk=0; chunk<num_chunks; chunk++)
-		{
-			unsigned char *data;
-			size_t data_size;
-			nestegg_packet_data(pkt, chunk, &data, &data_size);
-			avail_samples = vorbis_packet(vorbis_ctx, data, data_size);
-		}
-		nestegg_free_packet(pkt);
-	}
-	
-	samples = MIN(avail_samples, buf_size / (vorbis_ctx->channels * 2));
-	vorbis_getpcm(vorbis_ctx, audio_buf, samples);
-	avail_samples -= samples;
-	return samples * vorbis_ctx->channels * 2;
-}
-
-void audio_callback(void *userdata, Uint8 *stream, int len)
-{
-	vorbis_context *vorbis_ctx = (vorbis_context *)userdata;
-	int len1, audio_size;
-
-	static uint8_t audio_buf[(MAX_AUDIO_FRAME_SIZE * 3) / 2];
-	static unsigned int audio_buf_size = 0;
-	static unsigned int audio_buf_index = 0;
-
-	while(len > 0) {
-		if(audio_buf_index >= audio_buf_size) {
-			/* We have already sent all our data; get more */
-			audio_size = audio_decode_frame(vorbis_ctx, audio_buf, sizeof(audio_buf));
-			if(audio_size < 0) {
-				/* If error, output silence */
-				audio_buf_size = 1024; // arbitrary?
-				memset(audio_buf, 0, audio_buf_size);
-			} else {
-				audio_buf_size = audio_size;
-			}
-			audio_buf_index = 0;
-		}
-		len1 = audio_buf_size - audio_buf_index;
-		if(len1 > len)
-			len1 = len;
-		memcpy(stream, (uint8_t *)audio_buf + audio_buf_index, len1);
-		len -= len1;
-		stream += len1;
-		audio_buf_index += len1;
-	}
-}
+static int quit_video = 0;
+uint64_t audio_clock = 0.0;
 
 int webm_read(void *buffer, size_t length, void *userdata)
 {
@@ -190,7 +92,144 @@ int64_t webm_tell(void *userdata)
 	return ftell((FILE*)userdata);
 }
 
-int init_audio(nestegg *ctx, int track, vorbis_context *vorbis_ctx)
+FixedSizeQueue *queue_init(int max_size)
+{
+	FixedSizeQueue *queue = malloc(sizeof(FixedSizeQueue) + ((max_size - ANYNUMBER) * sizeof(void *)));
+	queue->start = 0;
+	queue->size = 0;
+	queue->max_size = max_size;
+	queue->mutex = mutex_create();
+	queue->not_full = cond_create();
+	queue->not_empty = cond_create();
+	return queue;
+}
+
+#define SPIT(fmt, ...) printf("%s:%i: " fmt, __func__, __LINE__, __VA_ARGS__)
+
+void queue_insert(FixedSizeQueue *queue, void *data)
+{
+	mutex_lock(queue->mutex);
+	//SPIT("size=%i\n", queue->size);
+	if (queue->size == queue->max_size)
+	{
+		while(cond_wait_timed(queue->not_full, queue->mutex, 10) != 0)
+		{
+			if (quit_video)
+			{
+				mutex_unlock(queue->mutex);
+				return;
+			}
+		}
+	}
+	assert(queue->size < queue->max_size);
+	int index = (queue->start + queue->size) % queue->max_size;
+	queue->data[index] = data;
+	queue->size++;
+	//SPIT("size=%i\n", queue->size);
+	cond_signal(queue->not_empty);
+	mutex_unlock(queue->mutex);
+}
+
+void *queue_get(FixedSizeQueue *queue)
+{
+	mutex_lock(queue->mutex);
+	//SPIT("size=%i\n", queue->size);
+	if (queue->size == 0)
+	{
+		while (cond_wait_timed(queue->not_empty, queue->mutex, 10) != 0)
+		{
+			if (quit_video)
+			{
+				mutex_unlock(queue->mutex);
+				return NULL;
+			}
+		}
+	}
+	assert(queue->size > 0);
+	void *data = queue->data[queue->start];
+	--queue->size;
+	queue->start = (queue->start + 1) % queue->max_size;
+	//SPIT("size=%i\n", queue->size);
+	cond_signal(queue->not_full);
+	mutex_unlock(queue->mutex);
+	return data;
+}
+
+void queue_destroy(FixedSizeQueue *queue)
+{
+	cond_destroy(queue->not_full);
+	cond_destroy(queue->not_empty);
+	mutex_destroy(queue->mutex);
+	free(queue);
+}
+
+int audio_decode_frame(audio_context *audio_ctx, uint8_t *audio_buf, int buf_size)
+{
+	vorbis_context *vorbis_ctx = &audio_ctx->vorbis_ctx;
+	static int avail_samples = 0;
+	static int samples = 0;
+
+	if (avail_samples == 0)
+	{
+		nestegg_packet *pkt;
+		uint64_t timestamp;
+		int chunk, num_chunks;
+		
+		if ((pkt = queue_get(audio_ctx->packet_queue)) == NULL)
+			return -1;
+		nestegg_packet_tstamp(pkt, &timestamp);
+		audio_clock = timestamp;
+		nestegg_packet_count(pkt, &num_chunks);
+		for (chunk=0; chunk<num_chunks; chunk++)
+		{
+			unsigned char *data;
+			size_t data_size;
+			nestegg_packet_data(pkt, chunk, &data, &data_size);
+			avail_samples = vorbis_packet(vorbis_ctx, data, data_size);
+		}
+		nestegg_free_packet(pkt);
+	}
+	else audio_clock += 1000000000LL * samples / audio_ctx->frequency;
+	
+	samples = MIN(avail_samples, buf_size / (vorbis_ctx->channels * 2));
+	vorbis_getpcm(vorbis_ctx, audio_buf, samples);
+	avail_samples -= samples;
+	return samples * vorbis_ctx->channels * 2;
+}
+
+void audio_callback(void *userdata, Uint8 *stream, int len)
+{
+	audio_context *audio_ctx = (audio_context *)userdata;
+	int len1, audio_size;
+
+	static uint8_t audio_buf[(MAX_AUDIO_FRAME_SIZE * 3) / 2];
+	static unsigned int audio_buf_size = 0;
+	static unsigned int audio_buf_index = 0;
+
+	while(len > 0) {
+		if(audio_buf_index >= audio_buf_size) {
+			/* We have already sent all our data; get more */
+			audio_size = audio_decode_frame(audio_ctx, audio_buf, sizeof(audio_buf));
+			if(audio_size < 0) {
+				/* If error, output silence */
+				audio_buf_size = 1024; // arbitrary?
+				memset(audio_buf, 0, audio_buf_size);
+			} else {
+				audio_buf_size = audio_size;
+			}
+			audio_buf_index = 0;
+		}
+		len1 = audio_buf_size - audio_buf_index;
+		if(len1 > len)
+			len1 = len;
+		memcpy(stream, (uint8_t *)audio_buf + audio_buf_index, len1);
+		len -= len1;
+		stream += len1;
+		audio_buf_index += len1;
+	}
+}
+
+int init_audio(nestegg *ctx, int track, audio_context *audio_ctx)
 {
 	SDL_AudioSpec wanted_spec;
 	nestegg_audio_params audioParams;
@@ -201,16 +240,96 @@ int init_audio(nestegg *ctx, int track, vorbis_context *vorbis_ctx)
 	wanted_spec.silence = 0;
 	wanted_spec.samples = 1024;
 	wanted_spec.callback = audio_callback;
-	wanted_spec.userdata = vorbis_ctx;
+	wanted_spec.userdata = audio_ctx;
 	printf("%f Hz, %d channels, %d bits/sample\n", audioParams.rate, audioParams.channels, audioParams.depth);
 	
-	vorbis_ctx->channels = audioParams.channels;
-	vorbis_ctx->demux_ctx = ctx;
-	packet_queue_init(&audioq);
+	audio_ctx->vorbis_ctx.channels = audioParams.channels;
+	audio_ctx->frequency = (int)audioParams.rate;
+	audio_ctx->packet_queue = queue_init(PACKET_QUEUE_SIZE);
 	
 	if (SDL_OpenAudio(&wanted_spec, NULL) == -1)
 		printf("failed to open audio device\n");
 	SDL_PauseAudio(0);
+}
+
+int video_thread(void *data)
+{
+	video_context *ctx = (video_context*) data;
+	
+	while(!quit_video)
+	{
+		unsigned int chunk, chunks;
+		nestegg_packet *pkt;
+		
+		pkt = queue_get(ctx->packet_queue);
+		if (quit_video) break;
+		nestegg_packet_count(pkt, &chunks);
+
+		for (chunk = 0; chunk < chunks; ++chunk)
+		{
+			unsigned char *data;
+			size_t data_size;
+			nestegg_packet_data(pkt, chunk, &data, &data_size);
+			
+			vpx_image_t *img;
+			vpx_codec_iter_t iter = NULL;
+			if (vpx_codec_decode(&ctx->vpx_ctx, data, data_size, NULL, 0))
+			{
+				printf("Failed to decode frame\n");
+				exit(1);
+			}
+			while((img = vpx_codec_get_frame(&ctx->vpx_ctx, &iter)))
+			{
+				static int nFrames = 0;
+				assert(img->d_w == ctx->width);
+				assert(img->d_h == ctx->height);
+				SDL_Overlay *overlay = SDL_CreateYUVOverlay(img->d_w, img->d_h, SDL_YV12_OVERLAY, ctx->screen);
+				
+				SDL_LockYUVOverlay(overlay);
+				for (int y=0; y < img->d_h; ++y)
+					memcpy(overlay->pixels[0]+(overlay->pitches[0]*y),
+						img->planes[0]+(img->stride[0]*y),
+						overlay->pitches[0]);
+				for (int y=0; y < img->d_h/2; ++y)
+					memcpy(overlay->pixels[1]+(overlay->pitches[1]*y),
+							img->planes[2]+(img->stride[2]*y),
+							overlay->pitches[1]);
+				for (int y=0; y < img->d_h/2; ++y)
+					memcpy(overlay->pixels[2]+(overlay->pitches[2]*y),
+							img->planes[1]+(img->stride[1]*y),
+							overlay->pitches[2]);
+				SDL_UnlockYUVOverlay(overlay);
+				
+				queue_insert(ctx->frame_queue, (void *)overlay);
+				
+				//printf("FPS: %f\n", nFrames * 1000.0 / SDL_GetTicks());
+				++nFrames;
+			}
+		}
+		nestegg_free_packet(pkt);
+	}
+	return 0;
+}
+
+int demux_thread(void *data)
+{
+	decoder_context *ctx = (decoder_context *)data;
+	nestegg_packet *pkt;
+	int r;
+	while ((r = nestegg_read_packet(ctx->demux_ctx, &pkt)) > 0)
+	{
+		unsigned int track;
+		nestegg_packet_track(pkt, &track);
+		
+		if (track == ctx->audio_stream)
+			queue_insert(ctx->audio_queue, pkt);
+		else if (track == ctx->video_stream)
+			queue_insert(ctx->video_ctx->packet_queue, pkt);
+		
+		if (quit_video) break;
+	}
+	quit_video = 1;
+	return 0;
 }
 
 int main(int argc, char **argv)
@@ -218,15 +337,14 @@ int main(int argc, char **argv)
 	FILE *webmfile;
 	nestegg_io io;
 	nestegg *demux_ctx;
-	vpx_codec_ctx_t vpx_ctx;
+	video_context video_ctx;
+	audio_context audio_ctx;
 	SDL_Surface *screen;
-	SDL_Overlay *overlay;
 	int video_stream = -1, audio_stream = -1;
-	vorbis_context vorbis_ctx;
 	
 	if (argc < 2)
 	{
-		fprintf(stderr, "Please provide a movie file\n");
+		fprintf(stderr, "Please provide a video file\n");
 		return 1;
 	}
 	
@@ -277,7 +395,7 @@ int main(int argc, char **argv)
 	
 	// init vorbis
 	int chunk, chunks;
-	vorbis_init(&vorbis_ctx);
+	vorbis_init(&audio_ctx.vorbis_ctx);
 	nestegg_track_codec_data_count(demux_ctx, audio_stream, &chunks);
 	assert(chunks == 3);
 	for (chunk=0; chunk<chunks; chunk++)
@@ -285,79 +403,66 @@ int main(int argc, char **argv)
 		unsigned char *data;
 		size_t data_size;
 		nestegg_track_codec_data(demux_ctx, audio_stream, chunk, &data, &data_size);
-		vorbis_headerpacket(&vorbis_ctx, data, data_size, chunk);
+		vorbis_headerpacket(&audio_ctx.vorbis_ctx, data, data_size, chunk);
 	}
-	vorbis_prepare(&vorbis_ctx);
-	init_audio(demux_ctx, audio_stream, &vorbis_ctx);
+	vorbis_prepare(&audio_ctx.vorbis_ctx);
+	init_audio(demux_ctx, audio_stream, &audio_ctx);
 
 	// init libvpx
-	if (vpx_codec_dec_init(&vpx_ctx, vpx_codec_vp8_dx(), NULL, 0))
+	if (vpx_codec_dec_init(&video_ctx.vpx_ctx, vpx_codec_vp8_dx(), NULL, 0))
 		exit(1);
-
-	screen = SDL_SetVideoMode(video_params.width, video_params.height, 32, SDL_ANYFORMAT);
+	video_ctx.packet_queue = queue_init(PACKET_QUEUE_SIZE);
+	video_ctx.frame_queue = queue_init(PACKET_QUEUE_SIZE);
+	video_ctx.screen = SDL_SetVideoMode(video_params.width, video_params.height, 32, SDL_ANYFORMAT);
+	video_ctx.width = video_params.width;
+	video_ctx.height = video_params.height;
 	
-	// Allocate a place to put our YUV image on that screen
-	overlay = SDL_CreateYUVOverlay(video_params.width, video_params.height, SDL_YV12_OVERLAY, screen);
+	// FIXME use actual packet timestamps
+	uint64_t default_frame_duration;
+	nestegg_track_default_duration(demux_ctx, video_stream, &default_frame_duration);
+	video_ctx.frame_delay = default_frame_duration;
 	
-	nestegg_packet *pkt;
-	int r;
-	while ((r = nestegg_read_packet(demux_ctx, &pkt)) > 0)
+	// start video thread
+	bor_thread *the_video_thread = thread_create(video_thread, &video_ctx);
+	
+	// start demux thread
+	decoder_context decoder_ctx;
+	decoder_ctx.demux_ctx = demux_ctx;
+	decoder_ctx.video_ctx = &video_ctx;
+	decoder_ctx.audio_queue = audio_ctx.packet_queue;
+	decoder_ctx.audio_stream = audio_stream;
+	decoder_ctx.video_stream = video_stream;
+	bor_thread *the_demux_thread = thread_create(demux_thread, &decoder_ctx);
+	
+	uint64_t next_frame_time = 0;
+	SDL_Rect rect = {0, 0, video_params.width, video_params.height};
+	
+	while(!quit_video)
 	{
-		unsigned int track;
-		nestegg_packet_track(pkt, &track);
-		
-		if (track == audio_stream)
-		{
-			packet_queue_put(&audioq, pkt);
-			continue;
-		}
-		
-		unsigned int chunk, chunks;
-		nestegg_packet_count(pkt, &chunks);
-		//printf("%i chunks\n", chunks);
+		SDL_Event event;
 
-		for (chunk = 0; chunk < chunks; ++chunk)
+		SDL_PollEvent(&event);
+		switch(event.type)
 		{
-			unsigned char *data;
-			size_t data_size;
-			nestegg_packet_data(pkt, chunk, &data, &data_size);
-			
-			if (track == video_stream)
-			{
-				vpx_image_t *img;
-				vpx_codec_iter_t iter = NULL;
-				if (vpx_codec_decode(&vpx_ctx, data, data_size, NULL, 0))
-				{
-					printf("Failed to decode frame\n");
-					exit(1);
-				}
-				while((img = vpx_codec_get_frame(&vpx_ctx, &iter)))
-				{
-					static int nFrames = 0;
-					SDL_Rect rect = {0, 0, img->d_w, img->d_h};
-					
-					SDL_LockYUVOverlay(overlay);
-					for (int y=0; y < video_params.height; ++y)
-						memcpy(overlay->pixels[0]+(overlay->pitches[0]*y),
-							img->planes[0]+(img->stride[0]*y),
-							overlay->pitches[0]);
-					for (int y=0; y < video_params.height/2; ++y)
-						memcpy(overlay->pixels[1]+(overlay->pitches[1]*y),
-								img->planes[2]+(img->stride[2]*y),
-								overlay->pitches[1]);
-					for (int y=0; y < video_params.height/2; ++y)
-						memcpy(overlay->pixels[2]+(overlay->pitches[2]*y),
-								img->planes[1]+(img->stride[1]*y),
-								overlay->pitches[2]);
-					SDL_UnlockYUVOverlay(overlay);
-					SDL_DisplayYUVOverlay(overlay, &rect);
-                    
-                    //printf("FPS: %f\n", (double)(++nFrames) * 1000 / SDL_GetTicks());
-				}
-			}
+		case SDL_QUIT:
+			quit_video = 1;
+			break;
+		default:
+			break;
 		}
-		nestegg_free_packet(pkt);
+		
+		if (next_frame_time <= audio_clock)
+		{
+			SDL_Overlay *overlay = (SDL_Overlay *)queue_get(video_ctx.frame_queue);
+			SDL_DisplayYUVOverlay(overlay, &rect);
+			SDL_FreeYUVOverlay(overlay);
+			next_frame_time += default_frame_duration;
+		}
 	}
+	
+	thread_join(the_demux_thread);
+	thread_join(the_video_thread);
+	
 	nestegg_destroy(demux_ctx);
 	SDL_Quit();
 	
