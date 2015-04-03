@@ -23,18 +23,19 @@
 #include "threads.h"
 #include "yuv.h"
 
-// temporary
-#define MAX_AUDIO_FRAME_SIZE 192000
-#define ANYNUMBER 2
-#define MIN(X,Y) (((X)<(Y))?(X):(Y))
-
 // lowering this can save a bit of memory but may cause lag
 #define PACKET_QUEUE_SIZE 10
 
+// temporary
+#define ANYNUMBER 2
+#define MIN(X,Y) (((X)<(Y))?(X):(Y))
+
 // temporary; copied from soundmix.c
+#define		MIXSHIFT		     3	    // 2 should be OK
+#define		MAXVOLUME		     64	    // 64 for backw. compat.
 #define		INT_TO_FIX(i)		((unsigned int)i<<12)
 #define		FIX_TO_INT(f)		((unsigned int)f>>12)
-#define		MUSIC_NUM_BUFFERS 4
+#define		MUSIC_NUM_BUFFERS	4
 #define		MUSIC_BUF_SIZE		(16*1024)	// In samples
 typedef struct
 {
@@ -88,6 +89,7 @@ typedef struct {
 
 typedef struct {
 	nestegg *demux_ctx;
+	audio_context *audio_ctx;
 	video_context *video_ctx;
 	FixedSizeQueue *audio_queue;
 	int audio_stream;
@@ -225,6 +227,7 @@ int audio_decode_frame(audio_context *audio_ctx, uint8_t *audio_buf, int buf_siz
 			uint64_t timestamp;
 			int chunk, num_chunks;
 
+			//fprintf(stderr, "audio queue size=%i\n", audio_ctx->packet_queue->size);
 			if ((pkt = queue_get(audio_ctx->packet_queue)) == NULL)
 				return -1;
 			nestegg_packet_tstamp(pkt, &timestamp);
@@ -249,11 +252,160 @@ int audio_decode_frame(audio_context *audio_ctx, uint8_t *audio_buf, int buf_siz
 	return buf_size;
 }
 
+int audio_thread(void *data)
+{
+	decoder_context *ctx = (decoder_context *)data;
+	audio_context *audio_ctx = ctx->audio_ctx;
+	int i, j;
+
+	while(!quit_video)
+	{
+		if(musicchannel.paused)
+		{
+			continue;
+		}
+
+		// Just to be sure: check if all goes well...
+		for(i = 0; i < MUSIC_NUM_BUFFERS; i++)
+		{
+			if(musicchannel.fp_playto[i] > INT_TO_FIX(MUSIC_BUF_SIZE))
+			{
+				musicchannel.fp_playto[i] = 0;
+			}
+		}
+
+		// Need to update?
+		for(j = 0, i = musicchannel.playing_buffer + 1; j < MUSIC_NUM_BUFFERS; j++, i++)
+		{
+			i %= MUSIC_NUM_BUFFERS;
+			if(musicchannel.fp_playto[i] == 0)
+			{
+				// Buffer needs to be filled
+				audio_decode_frame(audio_ctx, (uint8_t*)musicchannel.buf[i], MUSIC_BUF_SIZE * sizeof(short));
+				musicchannel.fp_playto[i] = INT_TO_FIX(MUSIC_BUF_SIZE);
+				if(!musicchannel.active)
+				{
+					musicchannel.playing_buffer = i;
+					musicchannel.active = 1;
+				}
+			}
+		}
+	}
+}
+
+int32_t mixbuf[0x10000];
+
+static void clearmixbuffer(unsigned int *buf, int n)
+{
+    while((--n) >= 0)
+    {
+        *buf = 0x8000 << MIXSHIFT;
+        ++buf;
+    }
+}
+
+// Input: number of input samples to mix
+static void mixaudio(unsigned int todo)
+{
+
+    static int i, chan, lvolume, rvolume, lmusic, rmusic;
+    static unsigned int fp_pos, fp_period, fp_len, fp_playto;
+    static int snum;
+    static unsigned char *sptr8;
+    static short *sptr16;
+
+    // First mix the music, if playing
+    if(musicchannel.active && !musicchannel.paused)
+    {
+
+        sptr16 = musicchannel.buf[musicchannel.playing_buffer];
+        fp_playto = musicchannel.fp_playto[musicchannel.playing_buffer];
+        fp_pos = musicchannel.fp_samplepos;
+        fp_period = musicchannel.fp_period;
+        lvolume = musicchannel.volume[0];
+        rvolume = musicchannel.volume[1];
+
+        // Mix it
+        for(i = 0; i < (int)todo;)
+        {
+
+            // Reached end of playable area,
+            // switch buffers or stop
+            if(fp_pos >= fp_playto)
+            {
+                // Done playing this one
+                musicchannel.fp_playto[musicchannel.playing_buffer] = 0;
+                // Advance to next buffer
+                musicchannel.playing_buffer++;
+                musicchannel.playing_buffer %= MUSIC_NUM_BUFFERS;
+                // Correct position in next buffer
+                fp_pos = fp_pos - fp_playto;
+                // Anything to play?
+                if(fp_pos < musicchannel.fp_playto[musicchannel.playing_buffer])
+                {
+                    // Yeah, switch!
+                    sptr16 = musicchannel.buf[musicchannel.playing_buffer];
+                    fp_playto = musicchannel.fp_playto[musicchannel.playing_buffer];
+                }
+                else
+                {
+                    // Nothing more to do
+                    // Also disable this buffer, just incase
+                    musicchannel.fp_playto[musicchannel.playing_buffer] = 0;
+                    fp_pos = 0;
+                    musicchannel.active = 0;
+                    // End for
+                    break;
+                }
+            }
+
+            // Mix a sample
+            lmusic = rmusic = sptr16[FIX_TO_INT(fp_pos)];
+            lmusic = (lmusic * lvolume / MAXVOLUME);
+            rmusic = (rmusic * rvolume / MAXVOLUME);
+            mixbuf[i++] += lmusic;
+            fp_pos += fp_period;
+        }
+        musicchannel.fp_samplepos = fp_pos;
+    }
+}
+
+void update_sample(unsigned char *buf, int size)
+{
+    int i, u, todo = size;
+    todo >>= 1;
+
+    clearmixbuffer((unsigned int *)mixbuf, todo);
+    mixaudio(todo);
+
+    {
+        unsigned short *dst = (unsigned short *)buf;
+        for(i = 0; i < todo; i++)
+        {
+            u = mixbuf[i] >> MIXSHIFT;
+            if (u < 0)
+            {
+                u = 0;
+            }
+            else if (u > 0xffff)
+            {
+                u = 0xffff;
+            }
+            u ^= 0x8000;
+            dst[i] = u;
+        }
+    }
+}
+
 void audio_callback(void *userdata, Uint8 *stream, int len)
 {
+#if 0
 	audio_context *audio_ctx = (audio_context *)userdata;
 	int status = audio_decode_frame(audio_ctx, stream, len);
 	if(status < 0) memset(stream, 0, len);
+#else
+	update_sample(stream, len);
+#endif
 }
 
 void init_audio(nestegg *ctx, int track, audio_context *audio_ctx)
@@ -277,16 +429,21 @@ void init_audio(nestegg *ctx, int track, audio_context *audio_ctx)
 	audio_ctx->frequency = (int)audioParams.rate;
 	audio_ctx->packet_queue = queue_init(PACKET_QUEUE_SIZE * 2);
 	audio_ctx->avail_samples = audio_ctx->last_samples = 0;
+	
+	//music_mutex = mutex_create();
+	//need_more_music = cond_create();
 
 	if (SDL_OpenAudio(&wanted_spec, NULL) == -1)
 		printf("failed to open audio device\n");
 	SDL_PauseAudio(0);
 
 	// initialize soundmix music channel
+	memset(&musicchannel, 0, sizeof(musicchannel));
 	musicchannel.fp_period = INT_TO_FIX(1); //INT_TO_FIX((int)audio_params.rate) / playfrequency;
-    musicchannel.volume[0] = 128;
-    musicchannel.volume[1] = 128;
+    musicchannel.volume[0] = 256;
+    musicchannel.volume[1] = 256;
     musicchannel.channels = audioParams.channels;
+	musicchannel.active = 1;
 
 	int i;
     for(i = 0; i < MUSIC_NUM_BUFFERS; i++)
@@ -453,16 +610,13 @@ int main(int argc, char **argv)
 	// init libvpx
 	if (vpx_codec_dec_init(&video_ctx.vpx_ctx, vpx_codec_vp8_dx(), NULL, 0))
 		exit(1);
-	video_ctx.packet_queue = queue_init(PACKET_QUEUE_SIZE);
+	video_ctx.packet_queue = queue_init(PACKET_QUEUE_SIZE * 2);
 	video_ctx.frame_queue = queue_init(PACKET_QUEUE_SIZE);
 	video_ctx.width = video_params.width;
 	video_ctx.height = video_params.height;
 	yuv_init(16);
 
-	// FIXME use actual packet timestamps
-	uint64_t default_frame_duration;
-	nestegg_track_default_duration(demux_ctx, video_stream, &default_frame_duration);
-	video_ctx.frame_delay = default_frame_duration;
+	nestegg_track_default_duration(demux_ctx, video_stream, &(video_ctx.frame_delay));
 
 	// initialize SDL video
 	SDL_Window *sdlWindow;
@@ -479,11 +633,15 @@ int main(int argc, char **argv)
 	// start demux thread
 	decoder_context decoder_ctx;
 	decoder_ctx.demux_ctx = demux_ctx;
+	decoder_ctx.audio_ctx = &audio_ctx;
 	decoder_ctx.video_ctx = &video_ctx;
 	decoder_ctx.audio_queue = audio_ctx.packet_queue;
 	decoder_ctx.audio_stream = audio_stream;
 	decoder_ctx.video_stream = video_stream;
 	bor_thread *the_demux_thread = thread_create(demux_thread, "demux", &decoder_ctx);
+	
+	// start audio thread
+	bor_thread *the_audio_thread = thread_create(audio_thread, "audio", &decoder_ctx);
 
 	uint64_t next_frame_time = 0;
 
@@ -550,9 +708,10 @@ int main(int argc, char **argv)
 	SDL_FreeSurface(surface);
 	thread_join(the_demux_thread);
 	thread_join(the_video_thread);
+	thread_join(the_audio_thread);
 
 	// FIXME: free unused frames and packets
-	//queue_destroy(audio_ctx.packet_queue);
+	queue_destroy(audio_ctx.packet_queue);
 	queue_destroy(video_ctx.packet_queue);
 	queue_destroy(video_ctx.frame_queue);
 
