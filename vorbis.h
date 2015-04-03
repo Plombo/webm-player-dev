@@ -2,14 +2,11 @@
 #define VORBIS_H
 
 #include <stdlib.h>
-#include "nestegg/nestegg.h"
 
 #if TREMOR
 #include <tremor/ivorbiscodec.h>
-#include "clipto15.h"
 #else
 #include <vorbis/codec.h>
-#include "vorbisfpu.h"
 #endif
 
 typedef struct {

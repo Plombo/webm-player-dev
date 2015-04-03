@@ -3,6 +3,7 @@
 #include <string.h>
 #include <assert.h>
 #include "vorbis.h"
+#include "samplecvt.h"
 
 void vorbis_init(vorbis_context *ctx)
 {
@@ -40,7 +41,7 @@ int vorbis_packet(vorbis_context *ctx, void *data, size_t size)
 #else
 	float **pcm;
 #endif
-	
+
 	ogg_packet op;
 	memset(&op, 0, sizeof(op));
 	op.packet = data;
@@ -49,7 +50,7 @@ int vorbis_packet(vorbis_context *ctx, void *data, size_t size)
 	op.e_o_s = 0;
 	op.granulepos = 0;
 	op.packetno = 3;
-	
+
 	int result = vorbis_synthesis(&ctx->vb, &op);
 	if (result != 0) fprintf(stdout, "vorbis_synthesis returned %i\n", result);
 	result = vorbis_synthesis_blockin(&ctx->v, &ctx->vb);
@@ -66,89 +67,12 @@ void vorbis_getpcm(vorbis_context *ctx, char *buffer, size_t samples)
 #else
 	float **pcm;
 #endif
-	
+
+	if (!samples) return;
 	int avail_samples = vorbis_synthesis_pcmout(&ctx->v, &pcm);
 	assert(avail_samples >= samples);
-	
-	// pack audio data
-	long channels = ctx->channels;
-	//char *buffer = malloc(samples * channels * 2);
-	int i, j;
 
-#if TREMOR
-	for (i=0; i<channels; i++)
-	{
-		ogg_int32_t *src = pcm[i];
-		short *dest = ((short *)buffer)+i;
-		for (j=0; j<samples; j++)
-		{
-			*dest = CLIP_TO_15(src[j]>>9);
-			dest += channels;
-		}
-	}
-#else
-	int word = 2;
-	int sgned = 1;
-	int bigendianp = 0, host_endian = 0;
-	long bytespersample = word * channels;
-	vorbis_fpu_control fpu;
-
-	/* a tight loop to pack each size */
-	{
-		int val;
-		if(word==1){
-			int off=(sgned?0:128);
-			vorbis_fpu_setround(&fpu);
-			for(j=0;j<samples;j++)
-				for(i=0;i<channels;i++){
-					val=vorbis_ftoi(pcm[i][j]*128.f);
-					if(val>127)val=127;
-					else if(val<-128)val=-128;
-					*buffer++=val+off;
-				}
-			vorbis_fpu_restore(fpu);
-		}else{
-			int off=(sgned?0:32768);
-
-			if(host_endian==bigendianp){
-				if(sgned){
-
-					vorbis_fpu_setround(&fpu);
-					for(i=0;i<channels;i++) { /* It's faster in this order */
-						float *src=pcm[i];
-						short *dest=((short *)buffer)+i;
-						for(j=0;j<samples;j++) {
-							val=vorbis_ftoi(src[j]*32768.f);
-							if(val>32767)val=32767;
-							else if(val<-32768)val=-32768;
-							*dest=val;
-							dest+=channels;
-						}
-					}
-					vorbis_fpu_restore(fpu);
-
-				}else{
-
-					vorbis_fpu_setround(&fpu);
-					for(i=0;i<channels;i++) {
-						float *src=pcm[i];
-						short *dest=((short *)buffer)+i;
-						for(j=0;j<samples;j++) {
-							val=vorbis_ftoi(src[j]*32768.f);
-							if(val>32767)val=32767;
-							else if(val<-32768)val=-32768;
-							*dest=val+off;
-							dest+=channels;
-						}
-					}
-					vorbis_fpu_restore(fpu);
-
-				}
-			}
-		}
-	}
-#endif
-
+	pack_samples(pcm, buffer, samples, ctx->channels);
     vorbis_synthesis_read(&ctx->v, samples);
 }
 

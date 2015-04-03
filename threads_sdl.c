@@ -7,9 +7,9 @@
 //typedef SDL_mutex bor_mutex;
 // typedef SDL_cond bor_cond;
 
-bor_thread *thread_create(int (*fn)(void *), void *data)
+bor_thread *thread_create(int (*fn)(void *), const char *name, void *data)
 {
-	return SDL_CreateThread(fn, data);
+	return SDL_CreateThread(fn, name, data);
 }
 
 void thread_join(bor_thread *thread)

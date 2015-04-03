@@ -78,6 +78,7 @@
 
 #include <stdlib.h>
 #include <stdint.h>
+#include "yuv.h"
 
 int *colortab;
 uint32_t *rgb_2_pix;

@@ -16,7 +16,7 @@ typedef SDL_cond bor_cond;
 #endif
 
 // creates a new thread that returns when fn returns
-bor_thread *thread_create(int (*fn)(void *), void *data);
+bor_thread *thread_create(int (*fn)(void *), const char *name, void *data);
 
 // waits for thread to finish
 void thread_join(bor_thread *thread);
