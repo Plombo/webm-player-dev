@@ -23,8 +23,9 @@
 #include "threads.h"
 #include "yuv.h"
 
-// lowering this can save a bit of memory but may cause lag
-#define PACKET_QUEUE_SIZE 10
+// lowering these might save a bit of memory but could also cause lag
+#define PACKET_QUEUE_SIZE 20
+#define FRAME_QUEUE_SIZE 10
 
 // temporary
 #define ANYNUMBER 2
@@ -206,6 +207,7 @@ yuv_frame *yuv_frame_create(int width, int height)
 
 void yuv_frame_destroy(yuv_frame *frame)
 {
+	if(frame == NULL) return;
 	free(frame->lum);
 	free(frame->cr);
 	free(frame->cb);
@@ -281,7 +283,8 @@ int audio_thread(void *data)
 			if(musicchannel.fp_playto[i] == 0)
 			{
 				// Buffer needs to be filled
-				audio_decode_frame(audio_ctx, (uint8_t*)musicchannel.buf[i], MUSIC_BUF_SIZE * sizeof(short));
+				if (audio_decode_frame(audio_ctx, (uint8_t*)musicchannel.buf[i], MUSIC_BUF_SIZE * sizeof(short)) < 0)
+					return 0;
 				musicchannel.fp_playto[i] = INT_TO_FIX(MUSIC_BUF_SIZE);
 				if(!musicchannel.active)
 				{
@@ -291,6 +294,8 @@ int audio_thread(void *data)
 			}
 		}
 	}
+
+	return 0;
 }
 
 int32_t mixbuf[0x10000];
@@ -427,7 +432,7 @@ void init_audio(nestegg *ctx, int track, audio_context *audio_ctx)
 	// initialize audio decoding context
 	audio_ctx->vorbis_ctx.channels = audioParams.channels;
 	audio_ctx->frequency = (int)audioParams.rate;
-	audio_ctx->packet_queue = queue_init(PACKET_QUEUE_SIZE * 2);
+	audio_ctx->packet_queue = queue_init(PACKET_QUEUE_SIZE);
 	audio_ctx->avail_samples = audio_ctx->last_samples = 0;
 	
 	//music_mutex = mutex_create();
@@ -465,7 +470,7 @@ int video_thread(void *data)
 
 		printf("video queue size=%i\n", ctx->packet_queue->size);
 		pkt = queue_get(ctx->packet_queue);
-		if (quit_video) break;
+		if (quit_video || pkt == NULL) break;
 		nestegg_packet_count(pkt, &chunks);
 		nestegg_packet_tstamp(pkt, &timestamp);
 
@@ -505,6 +510,7 @@ int video_thread(void *data)
 		nestegg_free_packet(pkt);
 	}
 
+	queue_insert(ctx->frame_queue, NULL);
 	return 0;
 }
 
@@ -519,13 +525,14 @@ int demux_thread(void *data)
 		nestegg_packet_track(pkt, &track);
 
 		if (track == ctx->audio_stream)
-			queue_insert(ctx->audio_queue, pkt);
+			queue_insert(ctx->audio_ctx->packet_queue, pkt);
 		else if (track == ctx->video_stream)
 			queue_insert(ctx->video_ctx->packet_queue, pkt);
 
 		if (quit_video) break;
 	}
-	quit_video = 1;
+	queue_insert(ctx->audio_ctx->packet_queue, NULL);
+	queue_insert(ctx->video_ctx->packet_queue, NULL);
 	return 0;
 }
 
@@ -610,8 +617,8 @@ int main(int argc, char **argv)
 	// init libvpx
 	if (vpx_codec_dec_init(&video_ctx.vpx_ctx, vpx_codec_vp8_dx(), NULL, 0))
 		exit(1);
-	video_ctx.packet_queue = queue_init(PACKET_QUEUE_SIZE * 2);
-	video_ctx.frame_queue = queue_init(PACKET_QUEUE_SIZE);
+	video_ctx.packet_queue = queue_init(PACKET_QUEUE_SIZE);
+	video_ctx.frame_queue = queue_init(FRAME_QUEUE_SIZE);
 	video_ctx.width = video_params.width;
 	video_ctx.height = video_params.height;
 	yuv_init(16);
@@ -635,7 +642,6 @@ int main(int argc, char **argv)
 	decoder_ctx.demux_ctx = demux_ctx;
 	decoder_ctx.audio_ctx = &audio_ctx;
 	decoder_ctx.video_ctx = &video_ctx;
-	decoder_ctx.audio_queue = audio_ctx.packet_queue;
 	decoder_ctx.audio_stream = audio_stream;
 	decoder_ctx.video_stream = video_stream;
 	bor_thread *the_demux_thread = thread_create(demux_thread, "demux", &decoder_ctx);
@@ -682,7 +688,7 @@ int main(int argc, char **argv)
 			printf("fc %lli, ac %lli, ", next_frame_time, audio_clock);
 			printf("uc %lli, ", system_clock);
 			yuv_frame *frame = (yuv_frame *)queue_get(video_ctx.frame_queue);
-			if (frame == NULL) continue;
+			if (frame == NULL) break;
 			// note: to swap red and blue components of output, just swap the cb and cr buffers
 			yuv_to_rgb(frame->lum, frame->cb, frame->cr, surface->pixels, surface->h, surface->w, 0);
 			next_frame_time = frame->timestamp;
@@ -710,14 +716,34 @@ int main(int argc, char **argv)
 	thread_join(the_video_thread);
 	thread_join(the_audio_thread);
 
-	// FIXME: free unused frames and packets
+	// clean up anything left in the queues
+	nestegg_packet *packet;
+	int size;
+	while(audio_ctx.packet_queue->size)
+	{
+		packet = (nestegg_packet *)queue_get(audio_ctx.packet_queue);
+		if(packet) nestegg_free_packet(packet);
+	}
+	while(video_ctx.packet_queue->size)
+	{
+		packet = (nestegg_packet *)queue_get(video_ctx.packet_queue);
+		if(packet) nestegg_free_packet(packet);
+	}
+	for(i=0, size=video_ctx.frame_queue->size; i<size; i++)
+		yuv_frame_destroy((yuv_frame *)queue_get(video_ctx.frame_queue));
+
+	// free the queues themselves
 	queue_destroy(audio_ctx.packet_queue);
 	queue_destroy(video_ctx.packet_queue);
 	queue_destroy(video_ctx.frame_queue);
 
+	// free up any memory used by libvpx, libvorbis, and nestegg
+	if(vpx_codec_destroy(&video_ctx.vpx_ctx))
+		printf("Warning: failed to destroy libvpx context: %s\n", vpx_codec_error(&video_ctx.vpx_ctx));
+	vorbis_destroy(&audio_ctx.vorbis_ctx);
 	nestegg_destroy(demux_ctx);
-	SDL_Quit();
 
+	SDL_Quit();
 	return 0;
 }
 
