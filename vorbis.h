@@ -18,6 +18,7 @@ typedef struct {
 } vorbis_context;
 
 void vorbis_init(vorbis_context *ctx);
+void vorbis_destroy(vorbis_context *ctx);
 void vorbis_prepare(vorbis_context *ctx);
 void vorbis_headerpacket(vorbis_context *ctx, void *data, size_t size, int packetCount);
 int vorbis_packet(vorbis_context *ctx, void *data, size_t size);

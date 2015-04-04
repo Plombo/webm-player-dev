@@ -11,6 +11,14 @@ void vorbis_init(vorbis_context *ctx)
 	vorbis_comment_init(&ctx->vc);
 }
 
+void vorbis_destroy(vorbis_context *ctx)
+{
+	vorbis_block_clear(&ctx->vb);
+	vorbis_dsp_clear(&ctx->v);
+	vorbis_comment_clear(&ctx->vc);
+	vorbis_info_clear(&ctx->vi);
+}
+
 // call after reading header packets but before audio data
 void vorbis_prepare(vorbis_context *ctx)
 {
