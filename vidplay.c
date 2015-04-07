@@ -72,8 +72,6 @@ typedef struct {
 typedef struct {
 	FixedSizeQueue *packet_queue;
 	vorbis_context vorbis_ctx;
-	vpx_codec_ctx_t vpx_ctx;
-	FixedSizeQueue *frame_queue;
 	int frequency;
 	int avail_samples;
 	int last_samples;
@@ -139,7 +137,9 @@ FixedSizeQueue *queue_init(int max_size)
 
 #define SPIT(fmt, ...) printf("%s:%i: " fmt, __func__, __LINE__, __VA_ARGS__)
 
-void queue_insert(FixedSizeQueue *queue, void *data)
+// returns 0 on success; <0 means that the caller should clean up
+// and exit
+int queue_insert(FixedSizeQueue *queue, void *data)
 {
 	mutex_lock(queue->mutex);
 	//SPIT("size=%i\n", queue->size);
@@ -150,7 +150,7 @@ void queue_insert(FixedSizeQueue *queue, void *data)
 			if (quit_video)
 			{
 				mutex_unlock(queue->mutex);
-				return;
+				return -1;
 			}
 		}
 	}
@@ -161,8 +161,11 @@ void queue_insert(FixedSizeQueue *queue, void *data)
 	//SPIT("size=%i\n", queue->size);
 	cond_signal(queue->not_empty);
 	mutex_unlock(queue->mutex);
+	return 0;
 }
 
+// returns pointer on success, NULL indicates that the caller
+// should clean up and exit
 void *queue_get(FixedSizeQueue *queue)
 {
 	mutex_lock(queue->mutex);
@@ -213,6 +216,18 @@ void yuv_frame_destroy(yuv_frame *frame)
 	free(frame->cb);
 	free(frame);
 }
+
+#ifndef WII
+// sleeps for the given number of microseconds
+void _usleep(uint64_t time)
+{
+	struct timespec sleeptime;
+	sleeptime.tv_sec = time / 1000000LL;
+	sleeptime.tv_nsec = (time % 1000000LL) * 1000;
+	nanosleep(&sleeptime, NULL);
+}
+#define usleep _usleep
+#endif
 
 int audio_decode_frame(audio_context *audio_ctx, uint8_t *audio_buf, int buf_size)
 {
@@ -293,6 +308,9 @@ int audio_thread(void *data)
 				}
 			}
 		}
+
+		// Sleep for 1 ms so that this thread doesn't waste CPU cycles busywaiting
+		usleep(1000);
 	}
 
 	return 0;
@@ -434,9 +452,6 @@ void init_audio(nestegg *ctx, int track, audio_context *audio_ctx)
 	audio_ctx->frequency = (int)audioParams.rate;
 	audio_ctx->packet_queue = queue_init(PACKET_QUEUE_SIZE);
 	audio_ctx->avail_samples = audio_ctx->last_samples = 0;
-	
-	//music_mutex = mutex_create();
-	//need_more_music = cond_create();
 
 	if (SDL_OpenAudio(&wanted_spec, NULL) == -1)
 		printf("failed to open audio device\n");
@@ -503,7 +518,12 @@ int video_thread(void *data)
 					memcpy(frame->cb+(y*img->d_w/2), img->planes[2]+(y*img->stride[2]), img->d_w / 2);
 				}
 
-				queue_insert(ctx->frame_queue, (void *)frame);
+				if (queue_insert(ctx->frame_queue, (void *)frame) < 0)
+				{
+					printf("destroying last frame\n");
+					yuv_frame_destroy(frame);
+					break;
+				}
 				timestamp += ctx->frame_delay;
 			}
 		}
@@ -700,14 +720,7 @@ int main(int argc, char **argv)
 		else
 		{
 			uint64_t sleeptime_ns = next_frame_time - system_clock;
-#if WII
 			usleep(sleeptime_ns / 1000);
-#else // Windows (MinGW) and POSIX
-			struct timespec sleeptime;
-			sleeptime.tv_sec = sleeptime_ns / 1000000000LL;
-			sleeptime.tv_nsec = sleeptime_ns % 1000000000LL;
-			nanosleep(&sleeptime, NULL);
-#endif
 		}
 	}
 
@@ -737,10 +750,13 @@ int main(int argc, char **argv)
 	queue_destroy(video_ctx.packet_queue);
 	queue_destroy(video_ctx.frame_queue);
 
-	// free up any memory used by libvpx, libvorbis, and nestegg
+	// clean up audio context
+	SDL_CloseAudio();
+	vorbis_destroy(&audio_ctx.vorbis_ctx);
+
+	// free up any memory used by libvpx and nestegg
 	if(vpx_codec_destroy(&video_ctx.vpx_ctx))
 		printf("Warning: failed to destroy libvpx context: %s\n", vpx_codec_error(&video_ctx.vpx_ctx));
-	vorbis_destroy(&audio_ctx.vorbis_ctx);
 	nestegg_destroy(demux_ctx);
 
 	SDL_Quit();
